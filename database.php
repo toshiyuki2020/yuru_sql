@@ -134,21 +134,67 @@ class Database {
      * @return array 暗号化済みパラメータ
      */
     private function encryptParams($sql, $params) {
-        if ($this->encryptionKey === '') return $params;
+      if ($this->encryptionKey === '') return $params;
 
-        $sql_clean = preg_replace('/\s+/', ' ', $sql);
-        preg_match('/(INSERT INTO|UPDATE)\s+`?(\w+)`?/i', $sql_clean, $tableMatch);
-        $table = $tableMatch[2] ?? '';
-        preg_match('/\((.*?)\)/', $sql_clean, $colMatch);
-        $columns = isset($colMatch[1]) ? array_map('trim', explode(',', $colMatch[1])) : [];
+      $sql_clean = preg_replace('/\s+/', ' ', trim($sql));
 
-        $newParams = [];
-        foreach ($params as $i => $val) {
-            $col = isset($columns[$i]) ? trim($columns[$i], '` ') : '';
-            $encrypt = isset($this->encryptColumns[$table]) && in_array($col, $this->encryptColumns[$table]);
-            $newParams[] = $encrypt ? $this->encrypt($val) : $val;
+      $table = '';
+      $mode  = '';
+      if (preg_match('/^\s*INSERT\s+INTO\s+`?([\w.]+)`?/i', $sql_clean, $m)) {
+        $table = $m[1];
+        $mode  = 'insert';
+      } elseif (preg_match('/^\s*UPDATE\s+`?([\w.]+)`?/i', $sql_clean, $m)) {
+        $table = $m[1];
+        $mode  = 'update';
+      }
+
+      $encCols = $this->encryptColumns[$table] ?? [];
+      if (!$encCols) return $params;
+
+      $colOrder = [];
+      if ($mode === 'insert') {
+        if (preg_match('/INSERT\s+INTO\s+`?[\w.]+`?\s*\(([^)]+)\)\s*VALUES\s*\(([^)]*)\)/i', $sql_clean, $m2)) {
+          $colOrder = array_map(
+            fn($s) => trim(trim($s), '` '),
+            explode(',', $m2[1])
+          );
+        } elseif (preg_match('/INSERT\s+INTO\s+`?[\w.]+`?\s+SET\s+(.+?)(?:\s+ON\s+DUPLICATE|\s*$)/i', $sql_clean, $m2)) {
+          $assigns = array_map('trim', explode(',', $m2[1]));
+          foreach ($assigns as $a) {
+            if (preg_match('/`?(\w+)`?\s*=/i', $a, $mm)) $colOrder[] = $mm[1];
+          }
         }
-        return $newParams;
+
+        if (preg_match('/ON\s+DUPLICATE\s+KEY\s+UPDATE\s+(.+)$/i', $sql_clean, $dup)) {
+          $assigns = array_map('trim', explode(',', $dup[1]));
+          foreach ($assigns as $a) {
+            if (preg_match('/`?(\w+)`?\s*=/i', $a, $mm)) $colOrder[] = $mm[1];
+          }
+        }
+      } else {
+        if (preg_match('/UPDATE\s+`?[\w.]+`?\s+SET\s+(.+?)(?:\s+WHERE|\s*$)/i', $sql_clean, $m2)) {
+          $assigns = array_map('trim', explode(',', $m2[1]));
+          foreach ($assigns as $a) {
+            if (preg_match('/`?(\w+)`?\s*=/i', $a, $mm)) $colOrder[] = $mm[1];
+          }
+        }
+      }
+
+      if (!$colOrder) {
+        return $params;
+      }
+
+      $new = [];
+      $N = count($colOrder);
+      foreach ($params as $i => $val) {
+        if ($i < $N) {
+          $col = $colOrder[$i] ?? '';
+          $new[] = (in_array($col, $encCols, true)) ? $this->encrypt($val) : $val;
+        } else {
+          $new[] = $val;
+        }
+      }
+      return $new;
     }
 
     /**
