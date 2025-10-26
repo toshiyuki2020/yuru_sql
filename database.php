@@ -136,9 +136,10 @@ class Database {
     private function encryptParams($sql, $params) {
         if ($this->encryptionKey === '') return $params;
 
-        preg_match('/(INSERT INTO|UPDATE)\s+`?(\w+)`?/i', $sql, $tableMatch);
+        $sql_clean = preg_replace('/\s+/', ' ', $sql);
+        preg_match('/(INSERT INTO|UPDATE)\s+`?(\w+)`?/i', $sql_clean, $tableMatch);
         $table = $tableMatch[2] ?? '';
-        preg_match('/\((.*?)\)/', $sql, $colMatch);
+        preg_match('/\((.*?)\)/', $sql_clean, $colMatch);
         $columns = isset($colMatch[1]) ? array_map('trim', explode(',', $colMatch[1])) : [];
 
         $newParams = [];
@@ -159,7 +160,8 @@ class Database {
     private function decryptResults($sql, $rows) {
         if ($this->encryptionKey === '') return $rows;
 
-        preg_match('/FROM\s+`?(\w+)`?/i', $sql, $match);
+        $sql_clean = preg_replace('/\s+/', ' ', $sql);
+        preg_match('/FROM\s+`?(\w+)`?/i', $sql_clean, $match);
         $table = $match[1] ?? '';
         if (!isset($this->encryptColumns[$table])) return $rows;
 
