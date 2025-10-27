@@ -15,9 +15,10 @@ return [
         'hash_columns' => [
           'users' => [
             'user_id_hash' => ['type' => 'hmac_sha256', 'normalize' => 'user_id'],
+            // normalizeはnone、email（余白削除で半角小文字）、number（余白記号を削除で半角数字）を選択
             'password'   => ['type' => 'argon2id'],
-            //typeがhmac_sha256はpepper_keyが設定されるとハッシュが実行されるようになる
-            //typoがArgon2idの場合はカラムが設定された段階でハッシュが実行されるようなる
+            // typeがhmac_sha256はpepper_keyが設定されるとハッシュが実行されるようになる
+            // typoがArgon2idの場合はカラムが設定された段階でハッシュが実行されるようなる
           ],
         ],
     ]

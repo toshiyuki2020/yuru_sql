@@ -604,7 +604,21 @@ class Database {
     private function normalizeEmail(?string $v): ?string {
       if ($v === null) return null;
       $v = trim($v);
+      $v = mb_convert_kana($v, 'as', 'UTF-8');
       $v = mb_strtolower($v, 'UTF-8');
+      return $v;
+    }
+
+    /** 数値系文字列（電話番号・郵便番号など）の正規化
+     * - 全角数字 → 半角
+     * - 数字以外（ハイフン・空白など）を除去
+     * - 前後空白除去
+     */
+    private function normalizeNumberLike(?string $v): ?string {
+      if ($v === null) return null;
+      $v = trim($v);
+      $v = mb_convert_kana($v, 'n', 'UTF-8'); // 全角→半角
+      $v = preg_replace('/[^0-9]/', '', $v);  // 数字以外を除去
       return $v;
     }
 
@@ -644,6 +658,8 @@ class Database {
         $norm = strtolower($rule['normalize'] ?? '');
         if ($norm === 'email') {
           $val = $this->normalizeEmail((string)$val);
+        } elseif ($norm === 'number') {
+          $val = $this->normalizeNumberLike((string)$val);
         }
         return $this->hmacSha256((string)$val);
       } elseif ($type === 'argon2id') {
