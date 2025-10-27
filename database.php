@@ -30,6 +30,12 @@ class Database {
     /** @var array テーブルごとの暗号化対象カラム（'users' => ['email', ...], ...） */
     private $encryptColumns;
 
+    /** @var string HMAC用ペッパー */
+    private $pepper = '';
+
+    /** @var array  ハッシュ規約 (table => [col => ['type'=>..., ...]]) */
+    private $hashColumns = [];
+
     /** @var PDO|mysqli データベース接続オブジェクト */
     private $connection;
 
@@ -46,6 +52,8 @@ class Database {
         $this->charset = $config['charset'] ?? 'utf8mb4';
         $this->encryptionKey = $config['encryption_key'] ?? '';
         $this->encryptColumns = $config['encrypt_columns'] ?? [];
+        $this->pepper       = $config['pepper_key']   ?? '';
+        $this->hashColumns  = $config['hash_columns'] ?? [];
 
         $this->connect();
     }
@@ -594,11 +602,6 @@ class Database {
         }
         return false;
     }
-
-    /** @var string HMAC用ペッパー */
-    private $pepper = '';
-    /** @var array  ハッシュ規約 (table => [col => ['type'=>..., ...]]) */
-    private $hashColumns = [];
 
     /** email正規化: 前後空白除去 + 小文字化（必要ならIDN対応等を追加） */
     private function normalizeEmail(?string $v): ?string {
