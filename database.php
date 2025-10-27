@@ -264,65 +264,66 @@ class Database {
      * @return array 暗号化済みパラメータ
      */
     private function encryptParams($sql, $params) {
-        if ($this->encryptionKey === '') return $params;
+      if ($this->encryptionKey === '' && empty($this->hashColumns)) return $params;
 
-        $sql_clean = preg_replace('/\s+/', ' ', trim($sql));
+      $sql_clean = preg_replace('/\s+/', ' ', trim($sql));
 
-        $table = '';
-        $mode  = '';
-        if (preg_match('/^\s*INSERT\s+INTO\s+`?([\w.]+)`?/i', $sql_clean, $m)) {
-            $table = $m[1];
-            $mode  = 'insert';
-        } elseif (preg_match('/^\s*UPDATE\s+`?([\w.]+)`?/i', $sql_clean, $m)) {
-            $table = $m[1];
-            $mode  = 'update';
+      $table = '';
+      $mode  = '';
+      if (preg_match('/^\s*INSERT\s+INTO\s+`?([\w.]+)`?/i', $sql_clean, $m)) {
+        $table = $m[1]; $mode = 'insert';
+      } elseif (preg_match('/^\s*UPDATE\s+`?([\w.]+)`?/i', $sql_clean, $m)) {
+        $table = $m[1]; $mode = 'update';
+      }
+
+      $encCols  = $this->encryptColumns[$table] ?? [];
+      $hashCols = array_keys($this->hashColumns[$table] ?? []);
+      if (!$encCols && !$hashCols) return $params;
+
+      // SET 対象カラムの順序抽出
+      $colOrder = [];
+      if ($mode === 'insert') {
+        if (preg_match('/INSERT\s+INTO\s+`?[\w.]+`?\s*\(([^)]+)\)\s*VALUES\s*\(([^)]*)\)/i', $sql_clean, $m2)) {
+          $colOrder = array_map(fn($s)=>trim(trim($s),'` '), explode(',', $m2[1]));
+        } elseif (preg_match('/INSERT\s+INTO\s+`?[\w.]+`?\s+SET\s+(.+?)(?:\s+ON\s+DUPLICATE|\s*$)/i', $sql_clean, $m2)) {
+          foreach (array_map('trim', explode(',', $m2[1])) as $a)
+            if (preg_match('/`?(\w+)`?\s*=/i', $a, $mm)) $colOrder[] = $mm[1];
         }
+        if (preg_match('/ON\s+DUPLICATE\s+KEY\s+UPDATE\s+(.+)$/i', $sql_clean, $dup)) {
+          foreach (array_map('trim', explode(',', $dup[1])) as $a)
+            if (preg_match('/`?(\w+)`?\s*=/i', $a, $mm)) $colOrder[] = $mm[1];
+        }
+      } else { // UPDATE
+        if (preg_match('/UPDATE\s+`?[\w.]+`?\s+SET\s+(.+?)(?:\s+WHERE|\s*$)/i', $sql_clean, $m2)) {
+          foreach (array_map('trim', explode(',', $m2[1])) as $a)
+            if (preg_match('/`?(\w+)`?\s*=/i', $a, $mm)) $colOrder[] = $mm[1];
+        }
+      }
+      if (!$colOrder) return $params;
 
-        $encCols = $this->encryptColumns[$table] ?? [];
-        if (!$encCols) return $params;
+      $new = [];
+      $N = count($colOrder);
+      foreach ($params as $i => $val) {
+        if ($i < $N) {
+          $col = $colOrder[$i] ?? '';
 
-        $colOrder = [];
-        if ($mode === 'insert') {
-            if (preg_match('/INSERT\s+INTO\s+`?[\w.]+`?\s*\(([^)]+)\)\s*VALUES\s*\(([^)]*)\)/i', $sql_clean, $m2)) {
-                $colOrder = array_map(
-                    fn($s) => trim(trim($s), '` '),
-                    explode(',', $m2[1])
-                );
-            } elseif (preg_match('/INSERT\s+INTO\s+`?[\w.]+`?\s+SET\s+(.+?)(?:\s+ON\s+DUPLICATE|\s*$)/i', $sql_clean, $m2)) {
-                $assigns = array_map('trim', explode(',', $m2[1]));
-                foreach ($assigns as $a) {
-                    if (preg_match('/`?(\w+)`?\s*=/i', $a, $mm)) $colOrder[] = $mm[1];
-                }
-            }
+          // 1) ハッシュ（あれば最優先）
+          if (isset(($this->hashColumns[$table] ?? [])[$col])) {
+            $val = $this->applyHashForColumn($table, $col, $val); // 下で定義
+            $new[] = $val;
+            continue;
+          }
 
-            if (preg_match('/ON\s+DUPLICATE\s+KEY\s+UPDATE\s+(.+)$/i', $sql_clean, $dup)) {
-                $assigns = array_map('trim', explode(',', $dup[1]));
-                foreach ($assigns as $a) {
-                    if (preg_match('/`?(\w+)`?\s*=/i', $a, $mm)) $colOrder[] = $mm[1];
-                }
-            }
+          // 2) 暗号化（ハッシュ指定が無い場合のみ）
+          if (in_array($col, $encCols, true)) {
+            $val = $this->encrypt($val);
+          }
+          $new[] = $val;
         } else {
-            if (preg_match('/UPDATE\s+`?[\w.]+`?\s+SET\s+(.+?)(?:\s+WHERE|\s*$)/i', $sql_clean, $m2)) {
-                $assigns = array_map('trim', explode(',', $m2[1]));
-                foreach ($assigns as $a) {
-                    if (preg_match('/`?(\w+)`?\s*=/i', $a, $mm)) $colOrder[] = $mm[1];
-                }
-            }
+          $new[] = $val;
         }
-
-        if (!$colOrder) return $params;
-
-        $new = [];
-        $N = count($colOrder);
-        foreach ($params as $i => $val) {
-            if ($i < $N) {
-                $col = $colOrder[$i] ?? '';
-                $new[] = (in_array($col, $encCols, true)) ? $this->encrypt($val) : $val;
-            } else {
-                $new[] = $val;
-            }
-        }
-        return $new;
+      }
+      return $new;
     }
 
     // ========= INSERT ... SELECT のエミュレーション =========
@@ -366,6 +367,7 @@ class Database {
         [$targetTable, $targetCols, $selectSql] = $parsed;
 
         // 1) SELECT（JOIN対応）して復号
+        $selParams = $this->applyHashForWhereParams($selectSql, $params, '');
         $sel = $this->fetchSelectDecrypted($selectSql, $params);
         if (!$sel['success']) return $sel;
         $rows = $sel['data'];
@@ -449,85 +451,98 @@ class Database {
      * @return array ['success' => bool, 'error' => string, 'data' => array, （insertの場合のみ）'last_insert_id' => int]
      */
     public function query($sql, $params = []) {
-        $result = ['success' => false, 'error' => '', 'data' => []];
+      $result = ['success' => false, 'error' => '', 'data' => []];
 
-        // INSERT ... SELECT はアプリ側で擬似実行（SELECT→復号→INSERT）
-        if ($this->isInsertSelect($sql)) {
-            return $this->emulateInsertSelect($sql, $params);
+      // INSERT ... SELECT はアプリ側で擬似実行（SELECT→復号→INSERT）
+      if ($this->isInsertSelect($sql)) {
+        return $this->emulateInsertSelect($sql, $params);
+      }
+
+      $isSelect         = preg_match('/^\s*(SELECT|SHOW)\b/i', $sql);
+      $isInsertOrUpdate = preg_match('/^\s*(INSERT|UPDATE)\b/i', $sql);
+      $isDelete         = preg_match('/^\s*DELETE\b/i', $sql);
+
+      if ($isInsertOrUpdate) {
+        // 1) SET側: ハッシュ→暗号（encryptParams内でハッシュ優先）
+        $params = $this->encryptParams($sql, $params);
+
+        // 2) WHERE側: HMACのみ適用（Argon2idは不可）
+        $targetTable = '';
+        if (preg_match('/^\s*UPDATE\s+`?([\w.]+)`?/i', preg_replace('/\s+/', ' ', trim($sql)), $m)) {
+          $targetTable = $m[1]; // テーブル名省略の col=? に備えて渡す
         }
+        $params = $this->applyHashForWhereParams($sql, $params, $targetTable);
 
-        $isSelect = preg_match('/^\s*(SELECT|SHOW)\b/i', $sql);
-        $isInsertOrUpdate = preg_match('/^\s*(INSERT|UPDATE)\b/i', $sql);
+      } elseif ($isSelect || $isDelete) {
+        // 検索/削除系は WHERE の HMAC だけ
+        $params = $this->applyHashForWhereParams($sql, $params, '');
+      }
 
-        if ($isInsertOrUpdate) {
-            $params = $this->encryptParams($sql, $params);
-        }
+      if ($this->type === 'pdo') {
+        try {
+          $stmt = $this->connection->prepare($sql);
+          $stmt->execute($params);
 
-        if ($this->type === 'pdo') {
-            try {
-                $stmt = $this->connection->prepare($sql);
-                $stmt->execute($params);
+          if ($isSelect) {
+            // JOIN対応の復号ルート
+            $data = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            $colMeta = $this->buildColMetaPDO($stmt);
+            $result['data'] = $this->decryptResultsWithMeta($data, $colMeta);
+          }
 
-                if ($isSelect) {
-                    // JOIN対応の復号ルートを常用
-                    $data = $stmt->fetchAll(PDO::FETCH_ASSOC);
-                    $colMeta = $this->buildColMetaPDO($stmt);
-                    $result['data'] = $this->decryptResultsWithMeta($data, $colMeta);
-                }
+          $result['success'] = true;
 
-                $result['success'] = true;
-
-                if ($isInsertOrUpdate) {
-                    $result['last_insert_id'] = $this->connection->lastInsertId();
-                }
-            } catch (PDOException $e) {
-                $result['error'] = $e->getMessage();
-            }
-            return $result;
-        }
-
-        // mysqli
-        if (!empty($params)) {
-            $stmt = $this->connection->prepare($sql);
-            if (!$stmt) {
-                $result['error'] = $this->connection->error;
-                return $result;
-            }
-            $types = $this->guessParamTypes($params);
-            $stmt->bind_param($types, ...$params);
-
-            if (!$stmt->execute()) {
-                $result['error'] = $stmt->error;
-                $stmt->close();
-                return $result;
-            }
-
-            if ($stmt->field_count > 0) {
-                $res = $stmt->get_result();
-                $data = $res->fetch_all(MYSQLI_ASSOC);
-                $colMeta = $this->buildColMetaMySQLi($res);
-                $result['data'] = $this->decryptResultsWithMeta($data, $colMeta);
-            }
-            $stmt->close();
-        } else {
-            $queryResult = $this->connection->query($sql);
-            if ($queryResult === false) {
-                $result['error'] = $this->connection->error;
-                return $result;
-            }
-
-            if ($queryResult instanceof mysqli_result) {
-                $colMeta = $this->buildColMetaMySQLi($queryResult);
-                $data = $queryResult->fetch_all(MYSQLI_ASSOC);
-                $result['data'] = $this->decryptResultsWithMeta($data, $colMeta);
-            }
-        }
-
-        $result['success'] = true;
-        if ($isInsertOrUpdate) {
-            $result['last_insert_id'] = $this->connection->insert_id;
+          if ($isInsertOrUpdate) {
+            $result['last_insert_id'] = $this->connection->lastInsertId();
+          }
+        } catch (PDOException $e) {
+          $result['error'] = $e->getMessage();
         }
         return $result;
+      }
+
+      // mysqli
+      if (!empty($params)) {
+        $stmt = $this->connection->prepare($sql);
+        if (!$stmt) {
+          $result['error'] = $this->connection->error;
+          return $result;
+        }
+        $types = $this->guessParamTypes($params);
+        $stmt->bind_param($types, ...$params);
+
+        if (!$stmt->execute()) {
+          $result['error'] = $stmt->error;
+          $stmt->close();
+          return $result;
+        }
+
+        if ($stmt->field_count > 0) {
+          $res = $stmt->get_result();
+          $data = $res->fetch_all(MYSQLI_ASSOC);
+          $colMeta = $this->buildColMetaMySQLi($res);
+          $result['data'] = $this->decryptResultsWithMeta($data, $colMeta);
+        }
+        $stmt->close();
+      } else {
+        $queryResult = $this->connection->query($sql);
+        if ($queryResult === false) {
+          $result['error'] = $this->connection->error;
+          return $result;
+        }
+
+        if ($queryResult instanceof mysqli_result) {
+          $colMeta = $this->buildColMetaMySQLi($queryResult);
+          $data = $queryResult->fetch_all(MYSQLI_ASSOC);
+          $result['data'] = $this->decryptResultsWithMeta($data, $colMeta);
+        }
+      }
+
+      $result['success'] = true;
+      if ($isInsertOrUpdate) {
+        $result['last_insert_id'] = $this->connection->insert_id;
+      }
+      return $result;
     }
 
     /**
@@ -578,5 +593,138 @@ class Database {
             return $this->connection->rollback();
         }
         return false;
+    }
+
+    /** @var string HMAC用ペッパー */
+    private $pepper = '';
+    /** @var array  ハッシュ規約 (table => [col => ['type'=>..., ...]]) */
+    private $hashColumns = [];
+
+    /** email正規化: 前後空白除去 + 小文字化（必要ならIDN対応等を追加） */
+    private function normalizeEmail(?string $v): ?string {
+      if ($v === null) return null;
+      $v = trim($v);
+      $v = mb_strtolower($v, 'UTF-8');
+      return $v;
+    }
+
+    /** HMAC-SHA256 (hex) */
+    private function hmacSha256(?string $v): ?string {
+      if ($v === null) return null;
+      $pepper = (string)$this->pepper;
+      return hash_hmac('sha256', $v, $pepper, false); // hex文字列
+    }
+
+    /** Argon2id */
+    private function argon2idHash(?string $v): ?string {
+      if ($v === null) return null;
+      // パラメータは必要に応じて調整
+      $opts = [
+        'memory_cost' => PASSWORD_ARGON2_DEFAULT_MEMORY_COST, // 1<<17 など
+        'time_cost'   => PASSWORD_ARGON2_DEFAULT_TIME_COST,   // 4 など
+        'threads'     => PASSWORD_ARGON2_DEFAULT_THREADS,     // 2 など
+      ];
+      return password_hash($v, PASSWORD_ARGON2ID, $opts);
+    }
+
+    /**
+     * 指定カラム用の派生（hash系）を適用
+     * - $table: 対象テーブル（INSERT/UPDATEの対象テーブル）
+     * - $col  : 対象カラム名（INSERT/UPDATEの左辺）
+     * - $val  : 入力値（? にバインドされる予定の値）
+     * 返り値: 変換後の値（指定が無ければ元のまま）
+     */
+    private function applyHashForColumn(string $table, string $col, $val) {
+      $rule = $this->hashColumns[$table][$col] ?? null;
+      if (!$rule) return $val;
+
+      $type = strtolower($rule['type'] ?? '');
+      if ($type === 'hmac_sha256') {
+        // 正規化オプション
+        $norm = strtolower($rule['normalize'] ?? '');
+        if ($norm === 'email') {
+          $val = $this->normalizeEmail((string)$val);
+        }
+        return $this->hmacSha256((string)$val);
+      } elseif ($type === 'argon2id') {
+        return $this->argon2idHash((string)$val);
+      }
+      return $val;
+    }
+
+    /**
+     * WHERE句の ? に対し、決定論的ハッシュ（HMAC）を自動適用する
+     * - INSERT/UPDATE では SET 側で消費した ? の"残り"に対して適用
+     * - SELECT では全 ? が対象（JOINのONは対象外想定）
+     * 制約: シンプルな "col = ?" / "table.col = ?" / "`table`.`col` = ?" / AND連結 のみ対応
+     */
+    private function applyHashForWhereParams(string $sql, array $params, string $targetTableForUpdate = ''): array {
+      if (empty($this->hashColumns)) return $params;
+
+      $sql_clean = preg_replace('/\s+/', ' ', trim($sql));
+      $whereCols = [];
+
+      // WHERE 句抽出
+      if (preg_match('/\bWHERE\s+(.+?)(?:\s+GROUP|\s+ORDER|\s+LIMIT|$)/i', $sql_clean, $m)) {
+        $w = $m[1];
+
+        // col = ? を左から順に拾う（括弧やOR/AND混在は基本OK、関数やIN(?)は対象外）
+        $re = '/(?:^|\s|\()([`.\w]+)\s*=\s*\?/i';
+        if (preg_match_all($re, $w, $mm)) {
+          foreach ($mm[1] as $raw) {
+            // raw: table.col / `table`.`col` / col
+            $raw = trim($raw, " \t\n\r\0\x0B`");
+            $parts = explode('.', $raw);
+            if (count($parts) === 2) {
+              $t = $parts[0];
+              $c = $parts[1];
+            } else {
+              // テーブル名が省略された時：UPDATEなら対象テーブル、SELECTなら不明（第一FROMを仮採用）
+              $t = $targetTableForUpdate;
+              if ($t === '' && preg_match('/\bFROM\s+`?([\w.]+)`?/i', $sql_clean, $fm)) {
+                $t = $fm[1];
+              }
+              $c = $parts[0];
+            }
+            $whereCols[] = [$t, $c];
+          }
+        }
+      }
+
+      if (empty($whereCols)) return $params;
+
+      // WHERE 側の?に順番に適用（HMACのみ。Argon2idは不可）
+      $out = $params;
+      $pi  = 0;
+      // SET側で使った?個数を推測（INSERT/UPDATE時のみ）
+      $setCount = 0;
+      if (preg_match('/^\s*UPDATE\b/i', $sql_clean)) {
+        if (preg_match('/\bSET\s+(.+?)(?:\s+WHERE|\s*$)/i', $sql_clean, $sm)) {
+          $setPart = $sm[1];
+          $setCount = substr_count($setPart, '?');
+        }
+      } elseif (preg_match('/^\s*INSERT\b/i', $sql_clean)) {
+        if (preg_match('/\)\s*VALUES\s*\(([^)]*)\)/i', $sql_clean, $im)) {
+          $setCount = substr_count($im[1], '?');
+        } elseif (preg_match('/\bSET\s+(.+?)(?:\s+ON\s+DUPLICATE|\s*$)/i', $sql_clean, $im2)) {
+          $setCount = substr_count($im2[1], '?');
+        }
+      }
+      $pi = $setCount; // WHEREの先頭?は配列中この位置から
+
+      foreach ($whereCols as [$t, $c]) {
+        if (!isset($out[$pi])) { $pi++; continue; }
+        $rule = $this->hashColumns[$t][$c] ?? null;
+        if ($rule && strtolower($rule['type'] ?? '') === 'hmac_sha256') {
+          // 正規化
+          $val = $out[$pi];
+          if (strtolower($rule['normalize'] ?? '') === 'email') {
+            $val = $this->normalizeEmail((string)$val);
+          }
+          $out[$pi] = $this->hmacSha256((string)$val);
+        }
+        $pi++;
+      }
+      return $out;
     }
 }
