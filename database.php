@@ -635,13 +635,24 @@ class Database {
     /** Argon2id */
     private function argon2idHash(?string $v): ?string {
       if ($v === null) return null;
-      // パラメータは必要に応じて調整
-      $opts = [
-        'memory_cost' => PASSWORD_ARGON2_DEFAULT_MEMORY_COST, // 1<<17 など
-        'time_cost'   => PASSWORD_ARGON2_DEFAULT_TIME_COST,   // 4 など
-        'threads'     => PASSWORD_ARGON2_DEFAULT_THREADS,     // 2 など
-      ];
-      return password_hash($v, PASSWORD_ARGON2ID, $opts);
+
+      // 1) Argon2id が使えるなら最優先（PHP 7.3+ & libargon2 が必要）
+      if (defined('PASSWORD_ARGON2ID')) {
+        $opts = [];
+        if (defined('PASSWORD_ARGON2_DEFAULT_MEMORY_COST')) $opts['memory_cost'] = PASSWORD_ARGON2_DEFAULT_MEMORY_COST;
+        if (defined('PASSWORD_ARGON2_DEFAULT_TIME_COST'))   $opts['time_cost']   = PASSWORD_ARGON2_DEFAULT_TIME_COST;
+        if (defined('PASSWORD_ARGON2_DEFAULT_THREADS'))     $opts['threads']     = PASSWORD_ARGON2_DEFAULT_THREADS;
+        return password_hash($v, PASSWORD_ARGON2ID, $opts);
+      }
+
+      // 2) Argon2i が使えるなら次善（PHP 7.2+ & libargon2）
+      if (defined('PASSWORD_ARGON2I')) {
+        return password_hash($v, PASSWORD_ARGON2I);
+      }
+
+      // 3) それも無ければ BCRYPT にフォールバック（PHP 5.5+）
+      //    例としてコスト12（環境に合わせて調整）
+      return password_hash($v, PASSWORD_BCRYPT, ['cost' => 12]);
     }
 
     /**
